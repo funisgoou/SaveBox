@@ -73,7 +73,7 @@ python app.py
 ## 项目结构
 
 ```
-twitter_download/
+SaveBox/
 ├── app.py                # 后端主程序：FastAPI 服务、API 路由、下载逻辑
 ├── requirements.txt      # Python 依赖
 ├── static/

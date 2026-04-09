@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>X Media Downloader</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            xblue: '#1d9bf0',
+            ytred: '#ff0000',
+            bilipink: '#fb7299',
+            xdark: '#0f172a',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #334155;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    .collapse-body { max-height: 0; overflow: hidden; transition: max-height .35s ease; }
+    .collapse-body.open { max-height: 600px; }
+    @keyframes fadein { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+    .toast-anim { animation: fadein .3s ease; }
+    .tab-btn { position: relative; }
+    .tab-btn.active::after {
+      content: '';
+      position: absolute; bottom: -1px; left: 0; right: 0;
+      height: 2px; border-radius: 1px;
+    }
+    .tab-btn[data-tab="twitter"].active::after { background: #1d9bf0; }
+    .tab-btn[data-tab="youtube"].active::after { background: #ff0000; }
+    .tab-btn[data-tab="bilibili"].active::after { background: #fb7299; }
+    @keyframes pulse-bar { 0%,100% { opacity: 1; } 50% { opacity: .7; } }
+    .progress-pulse { animation: pulse-bar 1.5s ease-in-out infinite; }
+  </style>
+</head>
+
+<body class="bg-slate-900 text-slate-200 min-h-screen flex flex-col">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-3xl mx-auto px-4 py-4 flex items-center gap-3">
+      <svg class="w-7 h-7 text-xblue flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">
+        <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+      </svg>
+      <div>
+        <h1 class="text-lg font-bold leading-tight tracking-tight">Media Downloader</h1>
+        <p class="text-xs text-slate-500">X/Twitter &middot; YouTube &middot; Bilibili</p>
+      </div>
+    </div>
+    <div class="max-w-3xl mx-auto px-4 flex gap-1">
+      <button onclick="switchTab('twitter')" data-tab="twitter"
+              class="tab-btn active px-4 py-2 text-sm font-medium text-slate-200 hover:text-white transition rounded-t-lg">
+        X / Twitter
+      </button>
+      <button onclick="switchTab('youtube')" data-tab="youtube"
+              class="tab-btn px-4 py-2 text-sm font-medium text-slate-400 hover:text-white transition rounded-t-lg">
+        YouTube
+      </button>
+      <button onclick="switchTab('bilibili')" data-tab="bilibili"
+              class="tab-btn px-4 py-2 text-sm font-medium text-slate-400 hover:text-white transition rounded-t-lg">
+        Bilibili
+      </button>
+    </div>
+  </header>
+
+  <main class="flex-1 max-w-3xl w-full mx-auto px-4 py-6 space-y-5">
+
+    <!-- ═══ Twitter ═══ -->
+    <div id="tab-twitter">
+      <div class="flex gap-2">
+        <input id="twUrlInput" type="text"
+               placeholder="粘贴 X / Twitter 推文链接（支持带中文标题）…"
+               class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-sm
+                      placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition"
+               onkeydown="if(event.key==='Enter')twAnalyze()">
+        <button onclick="twAnalyze()" id="twBtnAnalyze"
+                class="bg-xblue hover:bg-blue-600 active:scale-95 text-white font-medium px-5 py-2.5 rounded-lg text-sm
+                       transition whitespace-nowrap flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/>
+          </svg>
+          解析
+        </button>
+      </div>
+
+      <div class="mt-3 rounded-lg border border-slate-700/60">
+        <button onclick="toggleTwSettings()" class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-slate-400 hover:text-slate-200 transition">
+          <span class="flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z"/>
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+            </svg>
+            高级设置
+          </span>
+          <svg id="twChevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5"/>
+          </svg>
+        </button>
+        <div id="twSettingsBody" class="collapse-body border-t border-slate-700/60">
+          <div class="p-4 space-y-3">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">代理地址</label>
+              <input id="twProxy" placeholder="socks5://127.0.0.1:1080"
+                     class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Cookie</label>
+              <textarea id="twCookie" rows="3" placeholder='Netscape 或 JSON 格式…'
+                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition resize-y"></textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="twLoading" class="hidden flex justify-center py-10"><div class="spinner"></div></div>
+
+      <div id="twError" class="hidden mt-3 toast-anim rounded-lg border border-red-800/60 bg-red-950/50 px-4 py-3 text-sm text-red-300 flex items-start gap-2">
+        <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/>
+        </svg>
+        <span id="twErrorText"></span>
+      </div>
+
+      <div id="twResult" class="hidden mt-3 space-y-4">
+        <div class="bg-slate-800/70 rounded-lg border border-slate-700/60 overflow-hidden">
+          <div id="twThumbWrap" class="hidden"><img id="twThumbImg" class="w-full max-h-72 object-contain bg-black" alt=""></div>
+          <div class="p-4 space-y-2">
+            <div class="flex items-center gap-2 text-xs text-slate-400">
+              <span id="twType" class="bg-blue-600/30 text-blue-300 px-2 py-0.5 rounded font-medium uppercase text-[11px]"></span>
+              <span id="twAuthor" class="text-slate-300"></span>
+              <span id="twDate" class="ml-auto"></span>
+            </div>
+            <p id="twDesc" class="text-sm text-slate-300 leading-relaxed"></p>
+            <div id="twThreadBadge" class="hidden text-xs text-amber-400 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20"><path d="M4.75 2A2.75 2.75 0 002 4.75v3a2.75 2.75 0 002.75 2.75h3a2.75 2.75 0 002.75-2.75v-3A2.75 2.75 0 007.75 2h-3zM4.75 11.5A2.75 2.75 0 002 14.25v1A2.75 2.75 0 004.75 18h3a2.75 2.75 0 002.75-2.75v-1a2.75 2.75 0 00-2.75-2.75h-3zm7.75-3h3a2.75 2.75 0 002.75-2.75v-3A2.75 2.75 0 0015.5 0h-3A2.75 2.75 0 009.75 2.75v3a2.75 2.75 0 002.75 2.75zm0 3A2.75 2.75 0 009.75 14.25v1A2.75 2.75 0 0012.5 18h3a2.75 2.75 0 002.75-2.75v-1a2.75 2.75 0 00-2.75-2.75h-3z"/></svg>
+              Thread 推文串
+            </div>
+          </div>
+        </div>
+
+        <div id="twFormatCard" class="hidden bg-slate-800/70 rounded-lg border border-slate-700/60 p-4 space-y-3">
+          <h3 class="text-sm font-medium text-slate-300">选择分辨率</h3>
+          <div id="twFormatList" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+          <button onclick="twDownload()" id="twBtnDl"
+                  class="w-full bg-emerald-600 hover:bg-emerald-500 active:scale-[.98] text-white font-medium py-2.5 rounded-lg text-sm transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
+            下载视频
+          </button>
+        </div>
+
+        <div class="flex gap-2">
+          <button onclick="twArticle()" id="twBtnArticle"
+                  class="flex-1 bg-slate-700 hover:bg-slate-600 active:scale-[.98] text-slate-200 font-medium py-2.5 rounded-lg text-sm transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+            保存为 Markdown
+          </button>
+          <button onclick="twThread()" id="twBtnThread"
+                  class="hidden flex-1 bg-amber-700/70 hover:bg-amber-600/70 active:scale-[.98] text-amber-100 font-medium py-2.5 rounded-lg text-sm transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 7.5h.75v.75h-.75V7.5zm0 6h.75v.75h-.75v-.75zm6-6h.75v.75H13.5V7.5zm0 6h.75v.75h-.75v-.75zm6-6h.75v.75h-.75V7.5zm0 6h.75v.75h-.75v-.75zM3.75 3.75v16.5h16.5V3.75H3.75z"/></svg>
+            下载完整 Thread
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ YouTube ═══ -->
+    <div id="tab-youtube" class="hidden">
+      <div class="flex gap-2">
+        <input id="ytUrlInput" type="text"
+               placeholder="粘贴 YouTube 视频链接（支持带标题文字）…"
+               class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-sm
+                      placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-red-500/50 focus:border-red-500 transition"
+               onkeydown="if(event.key==='Enter')ytAnalyze()">
+        <button onclick="ytAnalyze()" id="ytBtnAnalyze"
+                class="bg-ytred hover:bg-red-700 active:scale-95 text-white font-medium px-5 py-2.5 rounded-lg text-sm transition whitespace-nowrap flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/></svg>
+          解析
+        </button>
+      </div>
+
+      <div class="mt-3 rounded-lg border border-slate-700/60">
+        <button onclick="toggleYtSettings()" class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-slate-400 hover:text-slate-200 transition">
+          <span class="flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+            高级设置
+          </span>
+          <svg id="ytChevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg>
+        </button>
+        <div id="ytSettingsBody" class="collapse-body border-t border-slate-700/60">
+          <div class="p-4 space-y-3">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">代理地址</label>
+              <input id="ytProxy" placeholder="socks5://127.0.0.1:1080"
+                     class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-red-500/40 transition">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Cookie</label>
+              <textarea id="ytCookie" rows="3" placeholder='用于访问年龄限制或会员视频…'
+                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-red-500/40 transition resize-y"></textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="ytLoading" class="hidden flex justify-center py-10"><div class="spinner"></div></div>
+
+      <div id="ytError" class="hidden mt-3 toast-anim rounded-lg border border-red-800/60 bg-red-950/50 px-4 py-3 text-sm text-red-300 flex items-start gap-2">
+        <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/>
+        </svg>
+        <span id="ytErrorText"></span>
+      </div>
+
+      <div id="ytResult" class="hidden mt-3 space-y-4">
+        <div class="bg-slate-800/70 rounded-lg border border-slate-700/60 overflow-hidden">
+          <div id="ytThumbWrap" class="hidden"><img id="ytThumbImg" class="w-full max-h-72 object-contain bg-black" alt=""></div>
+          <div class="p-4 space-y-2">
+            <div class="flex items-center gap-2 text-xs text-slate-400">
+              <span class="bg-red-600/30 text-red-300 px-2 py-0.5 rounded font-medium uppercase text-[11px]">VIDEO</span>
+              <span id="ytAuthor" class="text-slate-300"></span>
+              <span id="ytDate" class="ml-auto"></span>
+            </div>
+            <p id="ytTitle" class="text-sm font-medium text-slate-200"></p>
+            <p id="ytDesc" class="text-sm text-slate-400 leading-relaxed"></p>
+            <div id="ytDuration" class="text-xs text-slate-500"></div>
+          </div>
+        </div>
+
+        <div class="bg-slate-800/70 rounded-lg border border-slate-700/60 p-4 space-y-4">
+          <div>
+            <h3 class="text-sm font-medium text-slate-300 mb-2">选择分辨率</h3>
+            <div id="ytFormatList" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+          </div>
+          <div id="ytSubSection" class="hidden">
+            <h3 class="text-sm font-medium text-slate-300 mb-2">字幕烧录（可选）</h3>
+            <select id="ytSubSelect" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:ring-2 focus:ring-red-500/40 transition">
+              <option value="">不烧录字幕</option>
+            </select>
+            <p class="text-[11px] text-slate-500 mt-1">选择字幕后，将使用 ffmpeg 将字幕硬烧到视频中</p>
+          </div>
+          <button onclick="ytDownload()" id="ytBtnDl"
+                  class="w-full bg-emerald-600 hover:bg-emerald-500 active:scale-[.98] text-white font-medium py-2.5 rounded-lg text-sm transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
+            下载视频
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ Bilibili ═══ -->
+    <div id="tab-bilibili" class="hidden">
+      <div class="flex gap-2">
+        <input id="biliUrlInput" type="text"
+               placeholder="粘贴 Bilibili 视频链接（支持带中文标题）…"
+               class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-sm
+                      placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-pink-500 transition"
+               onkeydown="if(event.key==='Enter')biliAnalyze()">
+        <button onclick="biliAnalyze()" id="biliBtnAnalyze"
+                class="bg-bilipink hover:bg-pink-600 active:scale-95 text-white font-medium px-5 py-2.5 rounded-lg text-sm transition whitespace-nowrap flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/></svg>
+          解析
+        </button>
+      </div>
+
+      <div class="mt-3 rounded-lg border border-slate-700/60">
+        <button onclick="toggleBiliSettings()" class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-slate-400 hover:text-slate-200 transition">
+          <span class="flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+            高级设置
+          </span>
+          <svg id="biliChevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg>
+        </button>
+        <div id="biliSettingsBody" class="collapse-body border-t border-slate-700/60">
+          <div class="p-4 space-y-3">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">代理地址</label>
+              <input id="biliProxy" placeholder="socks5://127.0.0.1:1080"
+                     class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-pink-500/40 transition">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Cookie</label>
+              <textarea id="biliCookie" rows="3" placeholder='用于访问大会员或番剧视频…'
+                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-pink-500/40 transition resize-y"></textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="biliLoading" class="hidden flex justify-center py-10"><div class="spinner"></div></div>
+
+      <div id="biliError" class="hidden mt-3 toast-anim rounded-lg border border-red-800/60 bg-red-950/50 px-4 py-3 text-sm text-red-300 flex items-start gap-2">
+        <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/>
+        </svg>
+        <span id="biliErrorText"></span>
+      </div>
+
+      <div id="biliResult" class="hidden mt-3 space-y-4">
+        <div class="bg-slate-800/70 rounded-lg border border-slate-700/60 overflow-hidden">
+          <div id="biliThumbWrap" class="hidden"><img id="biliThumbImg" class="w-full max-h-72 object-contain bg-black" alt=""></div>
+          <div class="p-4 space-y-2">
+            <div class="flex items-center gap-2 text-xs text-slate-400">
+              <span class="bg-pink-600/30 text-pink-300 px-2 py-0.5 rounded font-medium uppercase text-[11px]">VIDEO</span>
+              <span id="biliAuthor" class="text-slate-300"></span>
+              <span id="biliDate" class="ml-auto"></span>
+            </div>
+            <p id="biliTitle" class="text-sm font-medium text-slate-200"></p>
+            <p id="biliDesc" class="text-sm text-slate-400 leading-relaxed"></p>
+            <div id="biliDuration" class="text-xs text-slate-500"></div>
+          </div>
+        </div>
+
+        <div class="bg-slate-800/70 rounded-lg border border-slate-700/60 p-4 space-y-4">
+          <div>
+            <h3 class="text-sm font-medium text-slate-300 mb-2">选择分辨率</h3>
+            <div id="biliFormatList" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+          </div>
+          <div id="biliSubSection" class="hidden">
+            <h3 class="text-sm font-medium text-slate-300 mb-2">字幕烧录（可选）</h3>
+            <select id="biliSubSelect" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-300 focus:outline-none focus:ring-2 focus:ring-pink-500/40 transition">
+              <option value="">不烧录字幕</option>
+            </select>
+            <p class="text-[11px] text-slate-500 mt-1">选择字幕后，将使用 ffmpeg 将字幕硬烧到视频中</p>
+          </div>
+          <button onclick="biliDownload()" id="biliBtnDl"
+                  class="w-full bg-emerald-600 hover:bg-emerald-500 active:scale-[.98] text-white font-medium py-2.5 rounded-lg text-sm transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
+            下载视频
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ Progress Bar (shared) ═══ -->
+    <div id="progressArea" class="hidden bg-slate-800/70 rounded-lg border border-slate-700/60 p-4">
+      <div class="flex items-center justify-between mb-2">
+        <span id="progressLabel" class="text-sm text-slate-300">下载中…</span>
+        <span id="progressPct" class="text-sm font-mono text-slate-400">0%</span>
+      </div>
+      <div class="w-full bg-slate-700 rounded-full h-2.5 overflow-hidden">
+        <div id="progressBar" class="bg-emerald-500 h-full rounded-full transition-all duration-300 progress-pulse" style="width:0%"></div>
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="text-center text-xs text-slate-600 py-4 border-t border-slate-800/60">
+    Powered by FastAPI + yt-dlp
+  </footer>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    function show(id) { $(id).classList.remove('hidden'); }
+    function hide(id) { $(id).classList.add('hidden'); }
+
+    /* ═══ URL extraction ═══ */
+    function extractUrl(text) {
+      const m = text.match(/https?:\/\/[^\s<>"']+/);
+      if (m) {
+        let url = m[0].replace(/[，。！？、）】》"']+$/, '');
+        return url;
+      }
+      return text.trim();
+    }
+
+    /* ═══ Tab switching ═══ */
+    function switchTab(tab) {
+      ['twitter', 'youtube', 'bilibili'].forEach(t => {
+        hide('tab-' + t);
+        const btn = document.querySelector(`[data-tab="${t}"]`);
+        btn.classList.toggle('active', t === tab);
+        btn.classList.toggle('text-slate-200', t === tab);
+        btn.classList.toggle('text-slate-400', t !== tab);
+      });
+      show('tab-' + tab);
+    }
+
+    /* ═══ Toggle helpers ═══ */
+    function makeToggle(bodyId, chevronId) {
+      return () => {
+        const body = $(bodyId), chev = $(chevronId);
+        body.classList.toggle('open');
+        chev.style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
+      };
+    }
+    const toggleTwSettings = makeToggle('twSettingsBody', 'twChevron');
+    const toggleYtSettings = makeToggle('ytSettingsBody', 'ytChevron');
+    const toggleBiliSettings = makeToggle('biliSettingsBody', 'biliChevron');
+
+    /* ═══ Format renderer ═══ */
+    function renderFormats(containerId, fmts) {
+      const wrap = $(containerId);
+      wrap.innerHTML = '';
+      let selected = fmts[0]?.format_id;
+      fmts.forEach((f, i) => {
+        const label = f.height + 'p';
+        const note = f.tbr ? ` ~${Math.round(f.tbr)}kbps` : '';
+        wrap.insertAdjacentHTML('beforeend', `
+          <label class="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-700 cursor-pointer
+                        hover:border-blue-500/50 has-[:checked]:border-blue-500 has-[:checked]:bg-blue-500/10 transition text-sm">
+            <input type="radio" name="${containerId}" value="${f.format_id}" ${i===0?'checked':''} class="accent-blue-500">
+            <span class="font-medium">${label}</span>
+            <span class="text-[11px] text-slate-500">${f.ext}${note}</span>
+          </label>
+        `);
+      });
+      wrap.querySelectorAll('input[type=radio]').forEach(r => {
+        r.addEventListener('change', () => { selected = r.value; });
+      });
+      return () => selected;
+    }
+
+    /* ═══ Subtitle renderer ═══ */
+    function renderSubtitles(selectId, sectionId, subs) {
+      const sel = $(selectId), sec = $(sectionId);
+      sel.innerHTML = '<option value="">不烧录字幕</option>';
+      if (!subs?.length) { hide(sectionId); return; }
+      subs.forEach(s => {
+        const tag = s.auto ? ' [自动]' : '';
+        sel.insertAdjacentHTML('beforeend', `<option value="${s.lang}">${s.lang} - ${s.name}${tag}</option>`);
+      });
+      show(sectionId);
+    }
+
+    /* ═══ Download with progress tracking ═══ */
+    function downloadWithProgress(apiUrl, body) {
+      return new Promise(async (resolve, reject) => {
+        try {
+          const r = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          if (!r.ok) {
+            const e = await r.json();
+            throw new Error(e.detail || `HTTP ${r.status}`);
+          }
+          const { task_id } = await r.json();
+
+          show('progressArea');
+          $('progressBar').style.width = '0%';
+          $('progressPct').textContent = '0%';
+          $('progressLabel').textContent = '下载中…';
+
+          const poll = setInterval(async () => {
+            try {
+              const pr = await fetch(`/api/progress/${task_id}`);
+              if (!pr.ok) throw new Error('progress fetch failed');
+              const data = await pr.json();
+
+              if (data.status === 'downloading') {
+                $('progressBar').style.width = data.progress + '%';
+                $('progressPct').textContent = data.progress + '%';
+                $('progressLabel').textContent = '下载中…';
+              } else if (data.status === 'merging') {
+                $('progressBar').style.width = '100%';
+                $('progressPct').textContent = '100%';
+                $('progressLabel').textContent = '合并音视频中…';
+              } else if (data.status === 'done') {
+                clearInterval(poll);
+                $('progressLabel').textContent = '准备下载文件…';
+
+                const fr = await fetch(`/api/file/${task_id}`);
+                if (!fr.ok) throw new Error('获取文件失败');
+                const blob = await fr.blob();
+                const disposition = fr.headers.get('content-disposition');
+                const filename = disposition
+                  ? disposition.split('filename=')[1]?.replace(/"/g, '')
+                  : (data.filename || 'video.mp4');
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(a.href);
+                hide('progressArea');
+                resolve();
+              } else if (data.status === 'error') {
+                clearInterval(poll);
+                hide('progressArea');
+                reject(new Error(data.error || '下载失败'));
+              }
+            } catch (e) {
+              clearInterval(poll);
+              hide('progressArea');
+              reject(e);
+            }
+          }, 500);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+
+    /* ═══ Twitter ═══ */
+    let twData = null, twGetFormat = null;
+    function twSettings() {
+      return { proxy: $('twProxy').value.trim() || null, cookie_content: $('twCookie').value.trim() || null };
+    }
+    function twShowError(msg) { $('twErrorText').textContent = msg; show('twError'); hide('twLoading'); }
+
+    async function twAnalyze() {
+      const raw = $('twUrlInput').value.trim();
+      if (!raw) return;
+      const url = extractUrl(raw);
+      hide('twError'); hide('twResult'); show('twLoading');
+      $('twBtnAnalyze').disabled = true;
+      try {
+        const r = await fetch('/api/analyze', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, ...twSettings() }),
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || `HTTP ${r.status}`); }
+        twData = await r.json();
+        renderTwResult(twData);
+      } catch (e) { twShowError(e.message); }
+      finally { hide('twLoading'); $('twBtnAnalyze').disabled = false; }
+    }
+
+    function renderTwResult(d) {
+      $('twType').textContent = d.type === 'video' ? 'VIDEO' : 'TEXT';
+      $('twType').className = d.type === 'video'
+        ? 'bg-blue-600/30 text-blue-300 px-2 py-0.5 rounded font-medium uppercase text-[11px]'
+        : 'bg-violet-600/30 text-violet-300 px-2 py-0.5 rounded font-medium uppercase text-[11px]';
+      $('twAuthor').textContent = d.uploader ? `@${d.uploader}` : '';
+      $('twDate').textContent = d.upload_date || '';
+      const desc = d.description || d.title || '';
+      $('twDesc').textContent = desc.length > 500 ? desc.slice(0, 500) + '…' : desc;
+      if (d.thumbnail) { $('twThumbImg').src = d.thumbnail; show('twThumbWrap'); } else { hide('twThumbWrap'); }
+      if (d.type === 'video' && d.formats?.length) { twGetFormat = renderFormats('twFormatList', d.formats); show('twFormatCard'); }
+      else { hide('twFormatCard'); }
+      if (d.is_thread) { show('twThreadBadge'); show('twBtnThread'); } else { hide('twThreadBadge'); hide('twBtnThread'); }
+      show('twResult'); hide('twError');
+    }
+
+    async function twDownload() {
+      if (!twData || !twGetFormat) return;
+      const btn = $('twBtnDl');
+      btn.disabled = true;
+      try {
+        await downloadWithProgress('/api/download', {
+          url: twData.url, format_id: twGetFormat(), ...twSettings(),
+        });
+      } catch (e) { twShowError(e.message); }
+      finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg> 下载视频';
+      }
+    }
+
+    async function twArticle() {
+      if (!twData) return;
+      try {
+        const r = await fetch('/api/article', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: twData.url, ...twSettings() }),
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '获取失败'); }
+        const { markdown } = await r.json();
+        const blob = new Blob([markdown], { type: 'text/markdown' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${twData.tweet_id || 'tweet'}.md`;
+        a.click(); URL.revokeObjectURL(a.href);
+      } catch (e) { twShowError(e.message); }
+    }
+
+    async function twThread() {
+      if (!twData) return;
+      const btn = $('twBtnThread');
+      btn.disabled = true; btn.textContent = '获取 Thread…';
+      try {
+        const r = await fetch('/api/thread', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: twData.url, ...twSettings() }),
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '获取 Thread 失败'); }
+        const { markdown, tweet_count } = await r.json();
+        const blob = new Blob([markdown], { type: 'text/markdown' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `thread_${twData.tweet_id}_${tweet_count}tweets.md`;
+        a.click(); URL.revokeObjectURL(a.href);
+      } catch (e) { twShowError(e.message); }
+      finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 7.5h.75v.75h-.75V7.5zm0 6h.75v.75h-.75v-.75zm6-6h.75v.75H13.5V7.5zm0 6h.75v.75h-.75v-.75zm6-6h.75v.75h-.75V7.5zm0 6h.75v.75h-.75v-.75zM3.75 3.75v16.5h16.5V3.75H3.75z"/></svg> 下载完整 Thread';
+      }
+    }
+
+    /* ═══ YouTube ═══ */
+    let ytData = null, ytGetFormat = null;
+    function ytSettings() {
+      return { proxy: $('ytProxy').value.trim() || null, cookie_content: $('ytCookie').value.trim() || null };
+    }
+    function ytShowError(msg) { $('ytErrorText').textContent = msg; show('ytError'); hide('ytLoading'); }
+
+    async function ytAnalyze() {
+      const raw = $('ytUrlInput').value.trim();
+      if (!raw) return;
+      const url = extractUrl(raw);
+      hide('ytError'); hide('ytResult'); show('ytLoading');
+      $('ytBtnAnalyze').disabled = true;
+      try {
+        const r = await fetch('/api/yt/analyze', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, ...ytSettings() }),
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || `HTTP ${r.status}`); }
+        ytData = await r.json();
+        renderYtResult(ytData);
+      } catch (e) { ytShowError(e.message); }
+      finally { hide('ytLoading'); $('ytBtnAnalyze').disabled = false; }
+    }
+
+    function renderYtResult(d) {
+      $('ytAuthor').textContent = d.uploader ? `@${d.uploader}` : '';
+      $('ytDate').textContent = d.upload_date || '';
+      $('ytTitle').textContent = d.title || '';
+      $('ytDesc').textContent = (d.description || '').length > 300 ? d.description.slice(0, 300) + '…' : (d.description || '');
+      if (d.duration) {
+        const m = Math.floor(d.duration / 60), s = d.duration % 60;
+        $('ytDuration').textContent = `时长: ${m}:${s.toString().padStart(2, '0')}`;
+      }
+      if (d.thumbnail) { $('ytThumbImg').src = d.thumbnail; show('ytThumbWrap'); } else { hide('ytThumbWrap'); }
+      ytGetFormat = renderFormats('ytFormatList', d.formats || []);
+      renderSubtitles('ytSubSelect', 'ytSubSection', d.subtitles);
+      show('ytResult'); hide('ytError');
+    }
+
+    async function ytDownload() {
+      if (!ytData || !ytGetFormat) return;
+      const btn = $('ytBtnDl');
+      btn.disabled = true;
+      try {
+        await downloadWithProgress('/api/yt/download', {
+          url: ytData.url, format_id: ytGetFormat(), subtitle_lang: $('ytSubSelect').value || null, ...ytSettings(),
+        });
+      } catch (e) { ytShowError(e.message); }
+      finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg> 下载视频';
+      }
+    }
+
+    /* ═══ Bilibili ═══ */
+    let biliData = null, biliGetFormat = null;
+    function biliSettings() {
+      return { proxy: $('biliProxy').value.trim() || null, cookie_content: $('biliCookie').value.trim() || null };
+    }
+    function biliShowError(msg) { $('biliErrorText').textContent = msg; show('biliError'); hide('biliLoading'); }
+
+    async function biliAnalyze() {
+      const raw = $('biliUrlInput').value.trim();
+      if (!raw) return;
+      const url = extractUrl(raw);
+      hide('biliError'); hide('biliResult'); show('biliLoading');
+      $('biliBtnAnalyze').disabled = true;
+      try {
+        const r = await fetch('/api/bili/analyze', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, ...biliSettings() }),
+        });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail || `HTTP ${r.status}`); }
+        biliData = await r.json();
+        renderBiliResult(biliData);
+      } catch (e) { biliShowError(e.message); }
+      finally { hide('biliLoading'); $('biliBtnAnalyze').disabled = false; }
+    }
+
+    function renderBiliResult(d) {
+      $('biliAuthor').textContent = d.uploader ? `@${d.uploader}` : '';
+      $('biliDate').textContent = d.upload_date || '';
+      $('biliTitle').textContent = d.title || '';
+      $('biliDesc').textContent = (d.description || '').length > 300 ? d.description.slice(0, 300) + '…' : (d.description || '');
+      if (d.duration) {
+        const m = Math.floor(d.duration / 60), s = d.duration % 60;
+        $('biliDuration').textContent = `时长: ${m}:${s.toString().padStart(2, '0')}`;
+      }
+      if (d.thumbnail) { $('biliThumbImg').src = d.thumbnail; show('biliThumbWrap'); } else { hide('biliThumbWrap'); }
+      biliGetFormat = renderFormats('biliFormatList', d.formats || []);
+      renderSubtitles('biliSubSelect', 'biliSubSection', d.subtitles);
+      show('biliResult'); hide('biliError');
+    }
+
+    async function biliDownload() {
+      if (!biliData || !biliGetFormat) return;
+      const btn = $('biliBtnDl');
+      btn.disabled = true;
+      try {
+        await downloadWithProgress('/api/bili/download', {
+          url: biliData.url, format_id: biliGetFormat(), subtitle_lang: $('biliSubSelect').value || null, ...biliSettings(),
+        });
+      } catch (e) { biliShowError(e.message); }
+      finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg> 下载视频';
+      }
+    }
+  </script>
+</body>
+</html>

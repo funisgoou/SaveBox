@@ -8,3 +8,5 @@ build/
 .venv/
 venv/
 docs/
+# local runtime data (SQLite history DB etc.)
+data/

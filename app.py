@@ -8,17 +8,19 @@ import os
 import re
 import json
 import uuid
+import time
+import sqlite3
 import tempfile
 import shutil
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Iterator
 
 import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -31,6 +33,15 @@ DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Default save directory (user-overridable per request via save_dir param).
+# Files land here directly and are NOT deleted after delivery.
+DEFAULT_SAVE_DIR = Path("downloads_done")
+
+# SQLite-backed task store (survives restarts; powers history + recovery).
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "tasks.db"
+
 # Bearer tokens used by Twitter/X web client (same as yt-dlp)
 _AUTH = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 _LEGACY_AUTH = "AAAAAAAAAAAAAAAAAAAAAIK1zgAAAAAA2tUWuhGZ2JceoId5GwYWU5GspY4%3DUq7gzFoCZs1QfwGoVdvSac3IniczZEYXIcDyumCauIXpcAPorE"
@@ -38,35 +49,156 @@ _API_BASE = "https://api.x.com/1.1/"
 _GRAPHQL_API_BASE = "https://x.com/i/api/graphql/"
 _GRAPHQL_ENDPOINT = "2ICDjqPd81tulZcYrtpTuQ/TweetResultByRestId"
 
-# ── Download task tracking ─────────────────────────────────────────────────────
-_download_tasks: dict = {}
+# ── Download task tracking (SQLite-backed, restart-safe) ──────────────────────
 _download_lock = threading.Lock()
+_db_lock = threading.Lock()
+
+# SSE subscribers: task_id -> list of queue.Queue. Progress updates push to all.
+_sse_subs: dict = {}
+_sse_lock = threading.Lock()
 
 
-def _create_task() -> str:
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _db_lock, _db_conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id     TEXT PRIMARY KEY,
+                url         TEXT,
+                platform    TEXT,
+                title       TEXT,
+                uploader    TEXT,
+                status      TEXT,
+                progress    INTEGER DEFAULT 0,
+                speed           REAL DEFAULT 0,
+                total_bytes     INTEGER DEFAULT 0,
+                downloaded_bytes INTEGER DEFAULT 0,
+                eta             INTEGER DEFAULT 0,
+                save_path   TEXT,
+                filename    TEXT,
+                error       TEXT,
+                created_at  REAL,
+                updated_at  REAL
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC)"
+        )
+        # ── migrations: live download telemetry columns (idempotent) ──
+        # Added so progress hooks can stream real speed/bytes/ETA to the UI.
+        # ALTER is a no-op (caught) once the column already exists.
+        for _col, _decl in (
+            ('speed', 'REAL DEFAULT 0'),
+            ('total_bytes', 'INTEGER DEFAULT 0'),
+            ('downloaded_bytes', 'INTEGER DEFAULT 0'),
+            ('eta', 'INTEGER DEFAULT 0'),
+        ):
+            try:
+                c.execute(f"ALTER TABLE tasks ADD COLUMN {_col} {_decl}")
+            except sqlite3.OperationalError:
+                pass  # column already exists on upgraded DBs
+
+
+_init_db()
+
+
+def _row_to_dict(row) -> Optional[dict]:
+    if row is None:
+        return None
+    d = dict(row)
+    # alias for legacy code that read 'file_path' / 'dldir'
+    d.setdefault('file_path', d.get('save_path'))
+    return d
+
+
+def _create_task(url: str = '', platform: str = '', title: str = '',
+                 uploader: str = '') -> str:
     task_id = uuid.uuid4().hex[:8]
-    with _download_lock:
-        _download_tasks[task_id] = {
-            'progress': 0,
-            'status': 'downloading',
-            'file_path': None,
-            'filename': None,
-            'dldir': None,
-            'error': None,
-        }
+    now = time.time()
+    with _db_lock, _db_conn() as c:
+        c.execute(
+            "INSERT INTO tasks (task_id, url, platform, title, uploader, "
+            "status, progress, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'downloading', 0, ?, ?)",
+            (task_id, url, platform, title, uploader, now, now),
+        )
     return task_id
 
 
 def _update_task(task_id: str, **kwargs):
-    with _download_lock:
-        if task_id in _download_tasks:
-            _download_tasks[task_id].update(kwargs)
+    now = time.time()
+    fields, vals = [], []
+    for k, v in kwargs.items():
+        # map legacy alias file_path -> save_path at write time
+        key = 'save_path' if k == 'file_path' else k
+        fields.append(f"{key}=?")
+        vals.append(v)
+    fields.append("updated_at=?")
+    vals.append(now)
+    vals.append(task_id)
+
+    with _db_lock, _db_conn() as c:
+        c.execute(
+            f"UPDATE tasks SET {', '.join(fields)} WHERE task_id=?", vals
+        )
+
+    # Push snapshot to SSE subscribers (non-blocking).
+    _sse_broadcast(task_id)
 
 
 def _get_task(task_id: str) -> Optional[dict]:
-    with _download_lock:
-        t = _download_tasks.get(task_id)
-        return dict(t) if t else None
+    with _db_lock, _db_conn() as c:
+        row = c.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def _list_tasks(limit: int = 50) -> List[dict]:
+    with _db_lock, _db_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+# ── SSE fan-out ───────────────────────────────────────────────────────────────
+import queue
+
+
+def _sse_subscribe(task_id: str):
+    q: "queue.Queue" = queue.Queue()
+    with _sse_lock:
+        _sse_subs.setdefault(task_id, []).append(q)
+    return q
+
+
+def _sse_unsubscribe(task_id: str, q):
+    with _sse_lock:
+        subs = _sse_subs.get(task_id)
+        if subs and q in subs:
+            subs.remove(q)
+        if subs is not None and not subs:
+            _sse_subs.pop(task_id, None)
+
+
+def _sse_broadcast(task_id: str):
+    """Push current task snapshot to all SSE subscribers for this task."""
+    task = _get_task(task_id)
+    if not task:
+        return
+    with _sse_lock:
+        subs = list(_sse_subs.get(task_id, []))
+    for q in subs:
+        try:
+            q.put_nowait(task)
+        except Exception:
+            pass  # drop if subscriber queue full; it'll re-sync on next tick
 
 
 def _yt_progress_hook(task_id: str):
@@ -75,9 +207,29 @@ def _yt_progress_hook(task_id: str):
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes', 0)
             pct = int(downloaded / total * 100) if total > 0 else 0
-            _update_task(task_id, progress=pct, status='downloading')
+            # cap below 100% while still downloading: yt-dlp sometimes reports
+            # 100 here before the 'finished' hook fires, which would make the
+            # UI look complete prematurely. The real 100% is set on 'done'.
+            pct = min(pct, 99)
+            _update_task(
+                task_id, progress=pct, status='downloading',
+                speed=d.get('speed') or 0,
+                total_bytes=total,
+                downloaded_bytes=downloaded,
+                eta=d.get('eta') or 0,
+            )
         elif d['status'] == 'finished':
-            _update_task(task_id, progress=100, status='merging')
+            # download bytes fully received → entering merge/transcode phase.
+            # Progress is intentionally NOT forced to 100% here: leave it at
+            # the last real value so the bar doesn't look done while merging.
+            final_total = (d.get('total_bytes')
+                           or d.get('total_bytes_estimate')
+                           or d.get('downloaded_bytes', 0) or 0)
+            _update_task(
+                task_id, status='merging', speed=0, eta=0,
+                downloaded_bytes=final_total,
+                total_bytes=final_total or 0,
+            )
     return hook
 
 
@@ -94,6 +246,7 @@ class DownloadRequest(BaseModel):
     format_id: str
     proxy: Optional[str] = None
     cookie_content: Optional[str] = None
+    save_dir: Optional[str] = None
 
 
 class VideoAnalyzeRequest(BaseModel):
@@ -108,6 +261,22 @@ class VideoDownloadRequest(BaseModel):
     subtitle_lang: Optional[str] = None
     proxy: Optional[str] = None
     cookie_content: Optional[str] = None
+    save_dir: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+    platform: str  # 'twitter' | 'youtube' | 'bilibili'
+    format_id: Optional[str] = None  # optional default; first available if None
+    subtitle_lang: Optional[str] = None
+    proxy: Optional[str] = None
+    cookie_content: Optional[str] = None
+    save_dir: Optional[str] = None
+    concurrency: int = 3
+
+
+class OpenFolderRequest(BaseModel):
+    path: str
 
 
 # ── URL Parsers ────────────────────────────────────────────────────────────────
@@ -155,13 +324,71 @@ def normalize_url(url: str) -> str:
     return re.sub(r'\?.*$', '', url).rstrip('/')
 
 
+def _looks_like_raw_cookie_header(text: str) -> bool:
+    """Heuristic: a raw `key=value; key=value` cookie header pasted from a browser.
+
+    Recognized when every non-empty chunk separated by ';' or newline is a
+    single `key=value` pair (value may contain '='). Distinguishes from JSON
+    (starts with '[') and Netscape (tab-separated, >=7 columns) formats.
+    """
+    if not text:
+        return False
+    chunks = re.split(r'[;\n]', text)
+    pairs = 0
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if '=' not in chunk:
+            return False
+        pairs += 1
+    return pairs > 0
+
+
+def _normalize_raw_cookie_header(text: str) -> str:
+    """Convert a raw `key=value; key=value` cookie header into Netscape format.
+
+    Each pair is written for both .x.com and .twitter.com so it works whether
+    yt-dlp / the API hits either host.
+    """
+    lines = ["# Netscape HTTP Cookie File"]
+    far_future = 2145916800  # 2037-12-31, generous non-expiring sentinel
+    for chunk in re.split(r'[;\n]', text):
+        chunk = chunk.strip()
+        if not chunk or '=' not in chunk:
+            continue
+        name, _, value = chunk.partition('=')
+        name = name.strip()
+        value = value.strip().strip('"')
+        if not name:
+            continue
+        for domain in ('.x.com', '.twitter.com'):
+            lines.append(
+                f"{domain}\tTRUE\t/\tTRUE\t{far_future}\t{name}\t{value}"
+            )
+    return '\n'.join(lines) + '\n'
+
+
 def parse_cookies(content: Optional[str]):
-    """Return (cookies_dict, temp_netscape_file_path | None)."""
+    """Return (cookies_dict, temp_netscape_file_path | None).
+
+    Accepts three input formats and auto-detects between them:
+      1. Raw browser cookie header: `key=value; key=value; ...`
+         (the string you copy from DevTools Application > Cookies or the
+         Cookie request header). Auto-converted to Netscape.
+      2. JSON array (browser-extension export): `[{"name","value",...}]`.
+      3. Netscape cookies.txt format: tab-separated, >=7 columns per line.
+    """
     if not content or not content.strip():
         return {}, None
 
     cookies: dict = {}
     text = content.strip()
+
+    # Raw browser cookie header -> convert to Netscape first
+    if _looks_like_raw_cookie_header(text) and not text.startswith('['):
+        text = _normalize_raw_cookie_header(text)
+
     tmp = tempfile.NamedTemporaryFile(
         mode='w', suffix='.txt', delete=False, encoding='utf-8'
     )
@@ -217,6 +444,73 @@ def cleanup(path: Optional[str]):
             os.unlink(path)
         except OSError:
             pass
+
+
+# ── Filename + save-dir helpers ───────────────────────────────────────────────
+_ILLEGAL_FN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_filename(name: str, max_len: int = 60) -> str:
+    """Strip illegal FS chars, collapse whitespace, truncate to max_len."""
+    if not name:
+        return ''
+    name = _ILLEGAL_FN_CHARS.sub(' ', name)
+    name = re.sub(r'\s+', ' ', name).strip().strip('.')
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    return name
+
+
+def build_save_filename(uploader: str, title: str, ext: str,
+                        quality_tag: str = '') -> str:
+    """Semantic filename: '@user_title[_quality].ext'.
+
+    Falls back gracefully when uploader/title are empty.
+    """
+    ext = ext.lstrip('.') or 'mp4'
+    parts: List[str] = []
+    if uploader:
+        parts.append(sanitize_filename(uploader, 30))
+    if title:
+        parts.append(sanitize_filename(title, 50))
+    if not parts:
+        parts.append(sanitize_filename(quality_tag, 30) or 'media')
+    if quality_tag:
+        parts.append(sanitize_filename(quality_tag, 12))
+    name = '_'.join(p for p in parts if p) or 'media'
+    return f"{name}.{ext}"
+
+
+def resolve_save_dir(save_dir: Optional[str]) -> Path:
+    """Resolve where final files land. Falls back to DEFAULT_SAVE_DIR.
+
+    User-supplied paths are taken as-is (we trust the local user; this is a
+    single-machine tool). Empty/invalid -> default dir.
+    """
+    if save_dir and save_dir.strip():
+        p = Path(save_dir.strip())
+    else:
+        p = DEFAULT_SAVE_DIR
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        p = DEFAULT_SAVE_DIR
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def unique_path(directory: Path, filename: str) -> Path:
+    """Return a non-clobbering path: append ' (n)' before extension if needed."""
+    target = directory / filename
+    if not target.exists():
+        return target
+    stem, ext = target.stem, target.suffix
+    n = 2
+    while True:
+        cand = directory / f"{stem} ({n}){ext}"
+        if not cand.exists():
+            return cand
+        n += 1
 
 
 def extract_video_formats(info: dict) -> list:
@@ -715,14 +1009,15 @@ async def download_video(req: DownloadRequest):
     if not tid:
         raise HTTPException(400, "无效的推文链接")
 
-    task_id = _create_task()
+    task_id = _create_task(url=url, platform='twitter')
     proxy = req.proxy
     cookie_content = req.cookie_content
     format_id = req.format_id
+    save_dir = resolve_save_dir(req.save_dir)
 
     def run():
         _, cookie_file = parse_cookies(cookie_content)
-        dldir = DOWNLOADS_DIR / tid
+        dldir = DOWNLOADS_DIR / f"tw_{task_id}"
         dldir.mkdir(exist_ok=True)
         try:
             opts: dict = {
@@ -737,28 +1032,40 @@ async def download_video(req: DownloadRequest):
             if cookie_file:
                 opts['cookiefile'] = cookie_file
 
+            info = None
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(url, download=True)
             except Exception:
                 opts['format'] = format_id
                 opts.pop('merge_output_format', None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(url, download=True)
 
             files = list(dldir.glob('*'))
             if not files:
                 _update_task(task_id, status='error', error='下载文件未生成')
                 return
 
-            fp = files[0]
-            filename = f"{tid}_{format_id}{fp.suffix}"
-            _update_task(task_id, status='done', file_path=str(fp),
-                        filename=filename, dldir=str(dldir))
+            # prefer the actual video file (skip stray subtitle files)
+            video_files = [f for f in files if f.suffix.lower()
+                           in ('.mp4', '.webm', '.mkv')]
+            src = (video_files or files)[0]
+
+            uploader = (info or {}).get('uploader') or ''
+            title = (info or {}).get('title') or tid
+            final_name = build_save_filename(
+                uploader, title, src.suffix.lstrip('.'),
+                quality_tag=f"{format_id}p" if format_id.isdigit() else ''
+            )
+            dest = unique_path(save_dir, final_name)
+            shutil.move(str(src), str(dest))
+            _update_task(task_id, status='done', save_path=str(dest),
+                        filename=dest.name, uploader=uploader, title=title)
         except Exception as exc:
-            shutil.rmtree(dldir, True)
             _update_task(task_id, status='error', error=str(exc))
         finally:
+            shutil.rmtree(dldir, True)
             cleanup(cookie_file)
 
     threading.Thread(target=run, daemon=True).start()
@@ -911,9 +1218,14 @@ async def bili_analyze(req: VideoAnalyzeRequest):
 
 def _start_video_download(url: str, format_id: str, subtitle_lang: Optional[str],
                           proxy: Optional[str], cookie_content: Optional[str],
-                          platform: str) -> str:
-    """Create a download task and run it in background. Returns task_id."""
-    task_id = _create_task()
+                          platform: str, save_dir: Optional[str] = None) -> str:
+    """Create a download task and run it in background. Returns task_id.
+
+    Final file is moved to `save_dir` (or DEFAULT_SAVE_DIR) with a semantic
+    name and kept there permanently. The temporary work dir is cleaned up.
+    """
+    task_id = _create_task(url=url, platform=platform)
+    final_save_dir = resolve_save_dir(save_dir)
 
     def run():
         dldir = DOWNLOADS_DIR / f"{platform}_{task_id}"
@@ -940,14 +1252,15 @@ def _start_video_download(url: str, format_id: str, subtitle_lang: Optional[str]
                 opts['subtitleslangs'] = [subtitle_lang]
                 opts['subtitlesformat'] = 'srt'
 
+            info = None
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(url, download=True)
             except Exception:
                 opts['format'] = format_id
                 opts.pop('merge_output_format', None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(url, download=True)
 
             files = list(dldir.glob('*'))
             if not files:
@@ -975,13 +1288,20 @@ def _start_video_download(url: str, format_id: str, subtitle_lang: Optional[str]
                 except Exception as exc:
                     logger.warning(f"Subtitle burn failed: {exc}")
 
-            filename = video_file.stem + video_file.suffix
-            _update_task(task_id, status='done', file_path=str(final_file),
-                        filename=filename, dldir=str(dldir))
+            uploader = (info or {}).get('uploader') or (info or {}).get('channel') or ''
+            title = (info or {}).get('title') or 'media'
+            quality_tag = f"{format_id}p" if format_id and format_id.isdigit() else ''
+            final_name = build_save_filename(
+                uploader, title, final_file.suffix.lstrip('.'), quality_tag
+            )
+            dest = unique_path(final_save_dir, final_name)
+            shutil.move(str(final_file), str(dest))
+            _update_task(task_id, status='done', save_path=str(dest),
+                        filename=dest.name, uploader=uploader, title=title)
         except Exception as exc:
-            shutil.rmtree(dldir, True)
             _update_task(task_id, status='error', error=str(exc))
         finally:
+            shutil.rmtree(dldir, True)
             cleanup(cookie_file)
 
     threading.Thread(target=run, daemon=True).start()
@@ -994,7 +1314,8 @@ async def yt_download(req: VideoDownloadRequest):
     if not parse_youtube_url(url):
         raise HTTPException(400, "无效的 YouTube 链接")
     task_id = _start_video_download(url, req.format_id, req.subtitle_lang,
-                                    req.proxy, req.cookie_content, 'youtube')
+                                    req.proxy, req.cookie_content, 'youtube',
+                                    req.save_dir)
     return {'task_id': task_id}
 
 
@@ -1004,7 +1325,8 @@ async def bili_download(req: VideoDownloadRequest):
     if not parse_bilibili_url(url):
         raise HTTPException(400, "无效的 B站链接")
     task_id = _start_video_download(url, req.format_id, req.subtitle_lang,
-                                    req.proxy, req.cookie_content, 'bilibili')
+                                    req.proxy, req.cookie_content, 'bilibili',
+                                    req.save_dir)
     return {'task_id': task_id}
 
 
@@ -1019,25 +1341,294 @@ async def get_progress(task_id: str):
 
 
 @app.get("/api/file/{task_id}")
-async def get_file(task_id: str, bg: BackgroundTasks):
+async def get_file(task_id: str):
+    """Legacy endpoint: stream the saved file to the browser.
+
+    Files are now kept permanently in save_dir, so this no longer deletes
+    anything after delivery. Kept for backward-compat; the new UI reads
+    save_path directly instead of pulling through this endpoint.
+    """
     task = _get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
     if task['status'] != 'done':
         raise HTTPException(400, "下载未完成")
 
-    file_path = Path(task['file_path'])
-    dldir = task.get('dldir')
+    file_path = Path(task.get('save_path') or task.get('file_path') or '')
+    if not file_path.exists():
+        raise HTTPException(404, "文件已被移动或删除")
 
-    def cleanup_task():
-        if dldir:
-            shutil.rmtree(dldir, True)
-        with _download_lock:
-            _download_tasks.pop(task_id, None)
-
-    bg.add_task(cleanup_task)
-    return FileResponse(file_path, filename=task.get('filename', 'video.mp4'),
+    return FileResponse(file_path, filename=task.get('filename', 'media.mp4'),
                         media_type='application/octet-stream')
+
+
+# ── Open folder (local OS integration) ────────────────────────────────────────
+@app.post("/api/open-folder")
+async def open_folder(req: OpenFolderRequest):
+    """Open the file's containing folder in the OS file manager, with the
+    file selected. Windows uses `explorer.exe /select,`; others fall back to
+    opening the parent dir.
+
+    Path safety: only allow paths that exist; reject path traversal in the
+    response (the OS call itself is the trust boundary on a local machine).
+    """
+    p = Path(req.path)
+    if not p.exists():
+        raise HTTPException(404, "文件不存在")
+    real = str(p.resolve())
+    try:
+        if os.name == 'nt':
+            # /select needs backslashes; quoted to survive spaces.
+            import subprocess
+            subprocess.Popen(
+                ['explorer.exe', '/select,', real],
+                shell=False,
+            )
+        else:
+            import subprocess
+            target = str(p.parent) if p.is_file() else real
+            subprocess.Popen(['xdg-open', target])
+    except Exception as exc:
+        raise HTTPException(500, f"无法打开文件夹：{exc}")
+    return {'ok': True, 'path': real}
+
+
+# ── SSE progress stream ───────────────────────────────────────────────────────
+@app.get("/api/progress/stream/{task_id}")
+async def progress_stream(task_id: str):
+    """Server-Sent Events stream of task progress snapshots.
+
+    Emits one `data:` line per status change until the task reaches a terminal
+    state (done/error), then closes.
+    """
+    task = _get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+
+    q = _sse_subscribe(task_id)
+
+    def event_stream() -> Iterator[bytes]:
+        try:
+            # send current snapshot immediately
+            snap = _get_task(task_id)
+            if snap:
+                yield f"data: {json.dumps(snap, ensure_ascii=False)}\n\n".encode()
+                if snap.get('status') in ('done', 'error'):
+                    return
+            while True:
+                try:
+                    snap = q.get(timeout=15)
+                except Exception:
+                    # heartbeat keeps the connection alive
+                    yield b": ping\n\n"
+                    continue
+                yield f"data: {json.dumps(snap, ensure_ascii=False)}\n\n".encode()
+                if snap.get('status') in ('done', 'error'):
+                    return
+        finally:
+            _sse_unsubscribe(task_id, q)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ── Batch download ────────────────────────────────────────────────────────────
+@app.post("/api/batch")
+async def batch_download(req: BatchRequest):
+    """Enqueue multiple URLs for the same platform. Returns per-url task ids.
+
+    Concurrency is bounded by a semaphore; each URL reuses the existing
+    single-download path. For Twitter multi-URL, each must be a video tweet.
+    """
+    if not req.urls:
+        raise HTTPException(400, "urls 不能为空")
+    platform = req.platform.lower()
+    if platform not in ('twitter', 'youtube', 'bilibili'):
+        raise HTTPException(400, "platform 必须是 twitter/youtube/bilibili")
+
+    concurrency = max(1, min(req.concurrency or 3, 6))
+    sem = threading.Semaphore(concurrency)
+    results: List[dict] = []
+    results_lock = threading.Lock()
+
+    def enqueue(url: str, index: int):
+        u = normalize_url(url)
+        tid = None
+        # validate per platform; skip invalid
+        if platform == 'twitter':
+            if parse_tweet_url(u):
+                tid = _twitter_batch_task(u, req, sem)
+        elif platform == 'youtube':
+            if parse_youtube_url(u):
+                fmt = req.format_id or _pick_default_format(u, req, 'youtube')
+                tid = _guarded_start(sem, u, fmt, req, 'youtube')
+        elif platform == 'bilibili':
+            if parse_bilibili_url(u):
+                fmt = req.format_id or _pick_default_format(u, req, 'bilibili')
+                tid = _guarded_start(sem, u, fmt, req, 'bilibili')
+
+        with results_lock:
+            results.append({
+                'index': index, 'url': url,
+                'task_id': tid,
+                'skipped': tid is None,
+            })
+
+    threads = []
+    for i, u in enumerate(req.urls):
+        t = threading.Thread(target=enqueue, args=(u, i), daemon=True)
+        t.start()
+        threads.append(t)
+    # we return immediately with task ids as they get created; join briefly so
+    # task_ids are populated before response
+    for t in threads:
+        t.join(timeout=5)
+
+    results.sort(key=lambda r: r['index'])
+    return {'tasks': results, 'platform': platform}
+
+
+def _guarded_start(sem: threading.Semaphore, url: str, fmt: str,
+                   req: 'BatchRequest', platform: str) -> str:
+    """Acquire semaphore then kick off a normal download task."""
+    sem.acquire()
+    try:
+        return _start_video_download(
+            url, fmt, req.subtitle_lang,
+            req.proxy, req.cookie_content, platform, req.save_dir,
+        )
+    finally:
+        # release after the task is *created* (not finished); the semaphore
+        # here just throttles task creation burst to avoid hammering the API.
+        sem.release()
+
+
+def _twitter_batch_task(url: str, req: 'BatchRequest',
+                        sem: threading.Semaphore) -> str:
+    """Twitter batch: analyze first to get a real format_id, then download.
+
+    yt-dlp Twitter format_ids are dynamic; we can't pass a user default safely.
+    """
+    sem.acquire()
+    try:
+        # pick best video format by analyzing first
+        _, cookie_file = parse_cookies(req.cookie_content)
+        fmt_id = '0'
+        try:
+            opts: dict = {'quiet': True, 'no_warnings': True}
+            if req.proxy:
+                opts['proxy'] = req.proxy
+            if cookie_file:
+                opts['cookiefile'] = cookie_file
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            fmts = extract_video_formats(info)
+            if fmts:
+                fmt_id = fmts[0]['format_id']  # best
+        except Exception:
+            pass
+        finally:
+            cleanup(cookie_file)
+        return _start_video_download(
+            url, fmt_id, None,
+            req.proxy, req.cookie_content, 'twitter', req.save_dir,
+        )
+    finally:
+        sem.release()
+
+
+def _pick_default_format(url: str, req: 'BatchRequest', platform: str) -> str:
+    """Analyze and return the best format_id for batch (best video)."""
+    _, cookie_file = parse_cookies(req.cookie_content)
+    try:
+        opts: dict = {'quiet': True, 'no_warnings': True}
+        if req.proxy:
+            opts['proxy'] = req.proxy
+        if cookie_file:
+            opts['cookiefile'] = cookie_file
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        fmts = extract_video_formats(info)
+        if fmts:
+            return fmts[0]['format_id']
+    except Exception:
+        pass
+    finally:
+        cleanup(cookie_file)
+    return 'best'
+
+
+# ── History ───────────────────────────────────────────────────────────────────
+@app.get("/api/history")
+async def history(limit: int = 50):
+    """Return recent tasks, newest first."""
+    limit = max(1, min(limit, 200))
+    return {'tasks': _list_tasks(limit)}
+
+
+def _purge_task_file(task: dict) -> bool:
+    """Delete the saved file for a task. Returns True if a file was removed.
+
+    Only the single file at save_path is touched — never the directory or
+    siblings. Missing files are silently skipped.
+    """
+    path_str = task.get('save_path') or task.get('file_path') or ''
+    if not path_str:
+        return False
+    p = Path(path_str)
+    try:
+        if p.is_file():
+            p.unlink()
+            logger.info(f"deleted file on history purge: {p}")
+            return True
+    except OSError as exc:
+        logger.warning(f"failed to delete file {p}: {exc}")
+    return False
+
+
+@app.delete("/api/history/{task_id}")
+async def delete_history_one(task_id: str, delete_file: bool = False):
+    """Delete a single history record. Optionally remove the saved file.
+
+    File deletion is irreversible; only the file at save_path is touched.
+    """
+    task = _get_task(task_id)
+    if not task:
+        raise HTTPException(404, "记录不存在")
+
+    file_removed = _purge_task_file(task) if delete_file else False
+
+    with _db_lock, _db_conn() as c:
+        c.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+    return {'ok': True, 'file_removed': file_removed}
+
+
+@app.delete("/api/history")
+async def delete_history_all(delete_file: bool = False):
+    """Clear all history records. Optionally remove all saved files.
+
+    Iterates over done tasks with a save_path; missing files are skipped.
+    """
+    tasks = _list_tasks(limit=200)
+    files_removed = 0
+    if delete_file:
+        for t in tasks:
+            if _purge_task_file(t):
+                files_removed += 1
+
+    with _db_lock, _db_conn() as c:
+        c.execute("DELETE FROM tasks")
+    logger.info(
+        f"cleared history: {len(tasks)} records, {files_removed} files removed"
+    )
+    return {'ok': True, 'cleared': len(tasks), 'files_removed': files_removed}
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
